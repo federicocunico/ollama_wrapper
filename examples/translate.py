@@ -3,53 +3,45 @@
 #   python translate.py --input path/to/book.txt --spacer "$$$$" --language "English" --model "aya-expanse"
 # Optional:
 #   --max-chars 12000   (approx context limit per request, in characters)
-#   --mode chat|generate  (chat recommended for better instruction-following)
-#   --stream             (stream translation tokens to stdout)
+#   --mode chat|generate
+#   --stream
+#   --url http://remote-host:11434
 
 from __future__ import annotations
 
 import argparse
-import os
+import json
 import re
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
-from ollama_wrapper import OllamaClient, OllamaOptions
+from ollama_wrapper import OllamaClient, OllamaOptions, OllamaError
 
 
 # -----------------------------
 # Sentence splitting & chunking
 # -----------------------------
 
-SENT_SPLIT_REGEX = re.compile(
-    # split on ., !, ?, … followed by whitespace and a new sentence start (letter/quote/number)
-    r'(?<=[\.\!\?\…])\s+(?=[A-ZÀ-ÖØ-Þ0-9"“])'
-)
+SENT_SPLIT_REGEX = re.compile(r'(?<=[\.\!\?\…])\s+(?=[A-ZÀ-ÖØ-Þ0-9"“])')
 
 
 def split_into_sentences(text: str) -> List[str]:
     text = text.strip()
     if not text:
         return []
-    # quick normalization of whitespace
     text = re.sub(r"\s+", " ", text)
     parts = SENT_SPLIT_REGEX.split(text)
-    # merge tiny trailing pieces if any weird split
-    sentences = [p.strip() for p in parts if p.strip()]
-    return sentences
+    return [p.strip() for p in parts if p.strip()]
 
 
 def pack_sentences(sentences: List[str], max_chars: int) -> List[str]:
-    """
-    Greedy pack sentences into chunks <= max_chars.
-    """
     chunks: List[str] = []
     buf: List[str] = []
     size = 0
     for s in sentences:
-        add = (1 if size > 0 else 0) + len(s)  # account for space joiner
+        add = (1 if size > 0 else 0) + len(s)
         if size + add <= max_chars or not buf:
             buf.append(s)
             size += add
@@ -75,7 +67,7 @@ DEFAULT_SYSTEM = (
 
 
 def build_user_prompt(text: str, language: str) -> str:
-    return f"Translate the following text into {language}.\n\n" f"--- BEGIN TEXT ---\n{text}\n--- END TEXT ---"
+    return f"Translate the following text into {language}.\n\n--- BEGIN TEXT ---\n{text}\n--- END TEXT ---"
 
 
 def translate_block(
@@ -91,33 +83,37 @@ def translate_block(
     opts = OllamaOptions(temperature=temperature)
     user = build_user_prompt(text, language)
 
-    if mode == "generate":
-        # single prompt mode: inline system guidance at top of prompt
-        prompt = f"{DEFAULT_SYSTEM}\n\n{user}"
+    try:
+        if mode == "generate":
+            prompt = f"{DEFAULT_SYSTEM}\n\n{user}"
+            if stream:
+                out = []
+                for t in client.generate(prompt, model, options=opts, stream=True):
+                    sys.stdout.write(t)
+                    sys.stdout.flush()
+                    out.append(t)
+                print()
+                return "".join(out)
+            return client.generate(prompt, model, options=opts, stream=False)
+
+        messages = [
+            {"role": "system", "content": DEFAULT_SYSTEM},
+            {"role": "user", "content": user},
+        ]
         if stream:
             out = []
-            for t in client.generate(prompt, model, options=opts, stream=True):
+            for t in client.chat(messages, model, options=opts, stream=True):
                 sys.stdout.write(t)
                 sys.stdout.flush()
                 out.append(t)
             print()
             return "".join(out)
-        return client.generate(prompt, model, options=opts, stream=False)
+        return client.chat(messages, model, options=opts, stream=False)
 
-    # default: chat with explicit system message
-    messages = [
-        {"role": "system", "content": DEFAULT_SYSTEM},
-        {"role": "user", "content": user},
-    ]
-    if stream:
-        out = []
-        for t in client.chat(messages, model, options=opts, stream=True):
-            sys.stdout.write(t)
-            sys.stdout.flush()
-            out.append(t)
-        print()
-        return "".join(out)
-    return client.chat(messages, model, options=opts, stream=False)
+    except OllamaError as e:
+        raise RuntimeError(f"Ollama request failed (model='{model}', mode='{mode}'): {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error while translating block (model='{model}'): {e}") from e
 
 
 # -----------------------------
@@ -130,46 +126,8 @@ def normalize_newlines(s: str) -> str:
 
 
 def split_chapters(raw_text: str, spacer: str) -> List[str]:
-    # keep empty chapters out; strip whitespace around each chapter
     parts = [p.strip() for p in raw_text.split(spacer)]
     return [p for p in parts if p]
-
-
-def translate_chapter(
-    client: OllamaClient,
-    model: str,
-    chapter_text: str,
-    language: str,
-    max_chars: int,
-    *,
-    mode: str = "chat",
-    stream: bool = False,
-) -> str:
-    """
-    If the chapter exceeds max_chars, split on sentence boundaries and translate in chunks.
-    Reassemble translated chunks with double newlines between chunks to encourage paragraph separation.
-    """
-    chapter_text = chapter_text.strip()
-    if not chapter_text:
-        return ""
-
-    if len(chapter_text) <= max_chars:
-        return translate_block(client, model, chapter_text, language, mode=mode, stream=stream)
-
-    sentences = split_into_sentences(chapter_text)
-    if not sentences:
-        # fallback: hard split
-        return _fallback_chunk_translate(client, model, chapter_text, language, max_chars, mode=mode, stream=stream)
-
-    chunks = pack_sentences(sentences, max_chars)
-    translated_parts: List[str] = []
-    for idx, ch in enumerate(chunks, 1):
-        print(f"    - translating chunk {idx}/{len(chunks)} (chars={len(ch)})")
-        translated = translate_block(client, model, ch, language, mode=mode, stream=False if not stream else False)
-        translated_parts.append(translated.strip())
-        # small pause to be gentle on local server
-        time.sleep(0.05)
-    return "\n\n".join(translated_parts)
 
 
 def _fallback_chunk_translate(
@@ -181,7 +139,7 @@ def _fallback_chunk_translate(
     *,
     mode: str = "chat",
     stream: bool = False,
-) -> str:
+) -> List[str]:
     parts: List[str] = []
     start = 0
     while start < len(text):
@@ -191,21 +149,89 @@ def _fallback_chunk_translate(
     out: List[str] = []
     for idx, p in enumerate(parts, 1):
         print(f"    - translating raw chunk {idx}/{len(parts)} (chars={len(p)})")
-        out.append(
-            translate_block(client, model, p, language, mode=mode, stream=False if not stream else False).strip()
-        )
+        out.append(translate_block(client, model, p, language, mode=mode, stream=False).strip())
         time.sleep(0.05)
-    return "\n\n".join(out)
+    return out
+
+
+def chunk_chapter(chapter_text: str, max_chars: int) -> List[str]:
+    if len(chapter_text) <= max_chars:
+        return [chapter_text]
+    sentences = split_into_sentences(chapter_text)
+    if not sentences:
+        return _fallback_chunk_translate  # type: ignore[return-value]
+    return pack_sentences(sentences, max_chars)
 
 
 # -----------------------------
-# Files & CLI
+# Files & utilities
 # -----------------------------
 
+# def try_read_text(path: Path) -> str:
+#     # Helpful, robust file reading with clear messages
+#     for enc in ("utf-8", "utf-16", "utf-8-sig"):
+#         try:
+#             return path.read_text(encoding=enc)
+#         except UnicodeError:
+#             continue
+#         except FileNotFoundError:
+#             raise FileNotFoundError(f"Input file not found: {path}")
+#         except Exception as e:
+#             raise RuntimeError(f"Error reading input file '{path}': {e}") from e
+#     raise UnicodeError(
+#         f"Could not decode '{path}'. Try re-saving as UTF-8, or pass a different encoding."
+#     )
 
-def save_chapter(out_fname: str, content: str) -> Path:
-    with open(out_fname, "w", encoding="utf-8") as f:
-        f.write(content)
+
+def try_read_text(path: Path) -> str:
+    """
+    Always try to read the file as UTF-16 first.
+    If it fails, raise a clear error.
+    """
+    try:
+        return path.read_text(encoding="utf-16")
+    except UnicodeError as e:
+        raise UnicodeError(
+            f"❌ Failed to decode '{path}' as UTF-16. "
+            "The file encoding might be different. "
+            "Ensure it is saved as UTF-16 or re-save it with UTF-8."
+        ) from e
+    except FileNotFoundError:
+        raise FileNotFoundError(f"❌ Input file not found: {path}")
+    except Exception as e:
+        raise RuntimeError(f"❌ Error reading input file '{path}': {e}") from e
+
+
+def save_text(path: Path, content: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except Exception as e:
+        raise RuntimeError(f"Failed to save file '{path}': {e}") from e
+
+
+def load_text_if_exists(path: Path) -> str | None:
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read existing chunk '{path}': {e}") from e
+    return None
+
+
+def merge_files_in_order(paths: List[Path]) -> str:
+    merged_parts: List[str] = []
+    for p in paths:
+        try:
+            merged_parts.append(p.read_text(encoding="utf-8").strip())
+        except Exception as e:
+            raise RuntimeError(f"Failed to read chunk for merge '{p}': {e}") from e
+    return "\n\n".join(merged_parts).strip()
+
+
+# -----------------------------
+# CLI main
+# -----------------------------
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -214,66 +240,154 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument("--input", required=True, help="Path to the input .txt file")
     parser.add_argument("--spacer", required=True, help='Chapter separator string (e.g., "$$$$")')
-    parser.add_argument("--language", required=True, help="Target language (e.g., English, Italian, Spanish)")
+    parser.add_argument("--language", required=True, default="Italian", help="Target language (e.g., English, Italian, Spanish)")
     parser.add_argument("--model", default="aya-expanse", help="Ollama model name (default: aya-expanse)")
-    parser.add_argument("--url", default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--url", default="http://localhost:11434", help="Ollama base URL (remote ok)")
     parser.add_argument("--timeout", type=int, default=200, help="HTTP timeout seconds")
     parser.add_argument("--retries", type=int, default=5, help="HTTP retries")
     parser.add_argument("--mode", choices=["chat", "generate"], default="chat", help="Use /chat or /generate")
-    parser.add_argument(
-        "--max-chars", type=int, default=2500, help="Approx max characters per request (tune to model context)."
-    )
+    parser.add_argument("--max-chars", type=int, default=2500, help="Approx max characters per request.")
     parser.add_argument("--stream", action="store_true", help="Stream tokens to stdout during translation")
     args = parser.parse_args(argv)
 
     in_path = Path(args.input)
-    if not in_path.exists():
-        print(f"Input file not found: {in_path}")
+    try:
+        raw = try_read_text(in_path)
+    except Exception as e:
+        print(f"❌ Failed to read input: {e}")
         return 1
-    raw = in_path.read_text(encoding="utf-16")
-    raw = normalize_newlines(raw)
 
+    raw = normalize_newlines(raw)
     print(f"Reading: {in_path} ({len(raw)} chars)")
     chapters = split_chapters(raw, args.spacer)
     if not chapters:
-        print("No chapters found. Check your --spacer.")
+        print("❌ No chapters found. Check your --spacer string.")
         return 1
 
-    # Output directory: translated/<bookname>
+    # Output directories
     bookname = in_path.stem
-    out_dir = Path("translated") / bookname
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output folder: {out_dir.resolve()}")
+    base_out_dir = Path("translated") / bookname
+    chunks_root = base_out_dir / "chunks"
+    final_root = base_out_dir
+    try:
+        base_out_dir.mkdir(parents=True, exist_ok=True)
+        chunks_root.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"❌ Cannot create output folders: {e}")
+        return 1
 
-    client = OllamaClient(base_url=args.url, timeout=args.timeout, retries=args.retries)
+    print(f"✅ Output folder: {final_root.resolve()}")
+    print(f"🔗 Using Ollama at: {args.url}")
 
-    # Best-effort check for model availability
-    available = set(client.list_models())
-    if args.model.split("@")[0] not in available:
-        print(f"⚠️  Model '{args.model}' is not available. Install with: ollama pull {args.model}")
-        # continue anyway—Ollama will error if missing
+    # Client
+    try:
+        client = OllamaClient(base_url=args.url, timeout=args.timeout, retries=args.retries)
+        # Best-effort model existence check
+        try:
+            available = set(client.list_models())
+            if args.model.split("@")[0] not in available:
+                print(
+                    f"⚠️  Model '{args.model}' not reported by server. If missing, install with:\n    ollama pull {args.model}"
+                )
+        except Exception as e:
+            print(f"⚠️  Could not list models from Ollama ({e}). Continuing anyway.")
+    except Exception as e:
+        print(f"❌ Failed to initialize Ollama client: {e}")
+        return 1
 
-    # Process each chapter
-    for i, ch in enumerate(chapters, start=1):
-        print(f"\nChapter {i}: {len(ch)} chars")
+    # Process chapters
+    for chap_idx, chapter_text in enumerate(chapters, start=1):
+        print(f"\n=== Chapter {chap_idx} ===")
+        chapter_len = len(chapter_text)
+        print(f"Chars: {chapter_len}")
 
-        out_file = out_dir / f"chapter_{i:03d}.txt"
+        chapter_dir = chunks_root / f"chapter_{chap_idx:03d}"
+        final_chapter_file = final_root / f"chapter_{chap_idx:03d}.txt"
 
-        if out_file.exists():
-            print(f"  ✓ Already exists: {out_file.name} (skipping)")
+        # If entire chapter fits and final exists, skip
+        if chapter_len <= args.max_chars and final_chapter_file.exists():
+            print(f"  ✓ Final chapter already exists: {final_chapter_file.name} (skipping)")
             continue
 
-        translated = translate_chapter(
-            client,
-            args.model,
-            ch,
-            args.language,
-            args.max_chars,
-            mode=args.mode,
-            stream=args.stream,
-        )
-        save_chapter(out_file, translated)
-        print(f"  ✓ Saved: {out_file.name}")
+        # Build chunks (by sentences)
+        try:
+            if chapter_len <= args.max_chars:
+                chunks = [chapter_text]
+            else:
+                sentences = split_into_sentences(chapter_text)
+                if sentences:
+                    chunks = pack_sentences(sentences, args.max_chars)
+                else:
+                    # fallback to raw slicing
+                    chunks = []
+                    start = 0
+                    while start < chapter_len:
+                        end = min(start + args.max_chars, chapter_len)
+                        chunks.append(chapter_text[start:end])
+                        start = end
+            print(f"  → {len(chunks)} chunk(s)")
+        except Exception as e:
+            print(f"❌ Failed to split chapter {chap_idx}: {e}")
+            continue
+
+        # Ensure chapter chunk dir
+        try:
+            chapter_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"❌ Cannot create chunk folder '{chapter_dir}': {e}")
+            continue
+
+        # Translate each chunk, saving individually (skip existing)
+        chunk_files: List[Path] = []
+        for ci, chunk_text in enumerate(chunks, start=1):
+            chunk_file = chapter_dir / f"chapter_{chap_idx:03d}_chunk_{ci:03d}.txt"
+            chunk_files.append(chunk_file)
+
+            existing = load_text_if_exists(chunk_file)
+            if existing is not None and existing.strip():
+                print(f"    ✓ Chunk {ci}/{len(chunks)} already exists (skipping)")
+                continue
+
+            print(f"    … Translating chunk {ci}/{len(chunks)} (chars={len(chunk_text)})")
+            try:
+                translated = translate_block(
+                    client=client,
+                    model=args.model,
+                    text=chunk_text,
+                    language=args.language,
+                    mode=args.mode,
+                    stream=False,  # per-chunk streaming is noisy; keep False
+                ).strip()
+            except Exception as e:
+                print(f"    ❌ Chunk {ci} failed (chapter {chap_idx}): {e}")
+                # Save an error marker so we know it failed (optional)
+                try:
+                    save_text(chunk_file.with_suffix(".error.txt"), f"ERROR: {e}\n")
+                except Exception as se:
+                    print(f"    ⚠️  Also failed to record error for chunk {ci}: {se}")
+                continue
+
+            # Save chunk
+            try:
+                save_text(chunk_file, translated)
+                print(f"    ✓ Saved chunk {ci} -> {chunk_file.name}")
+            except Exception as e:
+                print(f"    ❌ Failed to save chunk {ci}: {e}")
+                continue
+
+            time.sleep(0.05)
+
+        # Merge chunk files into final chapter if all chunks exist and are non-empty
+        try:
+            missing = [p for p in chunk_files if (not p.exists()) or (not p.read_text(encoding="utf-8").strip())]
+            if missing:
+                print(f"  ⚠️  Skipping merge for chapter {chap_idx}: {len(missing)} chunk(s) missing/empty.")
+            else:
+                merged = merge_files_in_order(chunk_files)
+                save_text(final_chapter_file, merged)
+                print(f"  ✅ Merged -> {final_chapter_file.name}")
+        except Exception as e:
+            print(f"  ❌ Failed to merge chapter {chap_idx}: {e}")
 
     print("\nAll done.")
     return 0
