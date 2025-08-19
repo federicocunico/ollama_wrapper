@@ -58,7 +58,9 @@ def translate_japanese(
     try:
         if stream:
             out_parts: List[str] = []
-            for token in client.chat(messages=messages, model=model, options=opts, stream=True):
+            for token in client.chat(
+                messages=messages, model=model, options=opts, stream=True
+            ):
                 sys.stdout.write(token)
                 sys.stdout.flush()
                 out_parts.append(token)
@@ -66,7 +68,9 @@ def translate_japanese(
                 sys.stdout.write("\n")
             return "".join(out_parts).strip()
         else:
-            result = client.chat(messages=messages, model=model, options=opts, stream=False)
+            result = client.chat(
+                messages=messages, model=model, options=opts, stream=False
+            )
             return result.strip()
     except OllamaError as e:
         print(f"❌ Ollama error: {e}", file=sys.stderr)
@@ -86,12 +90,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Translate English (or any language) text into Japanese using an Ollama model."
     )
-    parser.add_argument("text", nargs="?", help="Text to translate. If omitted, reads from stdin.")
-    parser.add_argument("--url", default="http://localhost:11434", help="Ollama base URL")
-    parser.add_argument("--timeout", type=int, default=200, help="HTTP timeout in seconds")
+    parser.add_argument(
+        "text", nargs="?", help="Text to translate. If omitted, reads from stdin."
+    )
+    parser.add_argument(
+        "--url", default="http://localhost:11434", help="Ollama base URL"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=200, help="HTTP timeout in seconds"
+    )
     parser.add_argument("--retries", type=int, default=5, help="HTTP retries")
     parser.add_argument("--model", default=MODEL_NAME, help="Ollama model name")
-    parser.add_argument("--temperature", type=float, default=TEMPERATURE, help="Sampling temperature")
+    parser.add_argument(
+        "--temperature", type=float, default=TEMPERATURE, help="Sampling temperature"
+    )
     parser.add_argument("--stream", action="store_true", help="Stream tokens to stdout")
     parser.add_argument(
         "--system",
@@ -124,5 +136,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("[W] No translation available, some error occurred.")
 
 
+def __test__():
+    sample = "It's incredible how the sun keeps going up and down every day."
+    client = init_client(base_url="http://localhost:11434", timeout=200, retries=5)
+    translated = translate_japanese(
+        client,
+        model=MODEL_NAME,
+        text=sample,
+        temperature=TEMPERATURE,
+        stream=False,
+        system_prompt=SYSTEM_PROMPT,
+    )
+    print(translated)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # __test__()
+    main()
