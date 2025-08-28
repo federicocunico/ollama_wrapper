@@ -91,11 +91,13 @@ class OllamaClient:
         options: Optional[OllamaOptions] = None,
         format: Optional[str] = None,  # e.g. "json"
         stream: bool = False,
+        think: bool = False
     ) -> str | Generator[str, None, str]:
         payload: Dict[str, Any] = {
             "model": model,
             "prompt": prompt,
             "stream": stream,
+            "think": think,
             "options": (options or OllamaOptions()).to_dict(),
         }
         if format:
